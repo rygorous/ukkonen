@@ -1,21 +1,86 @@
 use std::str;
 
-#[derive(Clone, Copy, PartialEq)]
-enum NodeRef {
-    Leaf(u32),
-    Inner(u32),
+// Store positions in packed (u32) form; this limits us to under 4GB of
+// payload but makes the data structures a bit more compact.
+struct PackedPos(u32);
+
+impl PackedPos {
+    fn from(pos: usize) -> PackedPos {
+        assert!(pos <= std::u32::MAX as usize);
+        PackedPos(pos as u32)
+    }
+
+    fn unpack(&self) -> usize {
+        self.0 as usize
+    }
 }
 
+// Leaves are treated separately from internal nodes, since the only
+// data they actually have is their beginning character; they can be
+// mostly implied and don't need an actual node representation.
+#[derive(PartialEq)]
+enum NodeRef {
+    Leaf(usize),
+    Inner(usize),
+}
+
+// Node references are also packed into u32s, which further limits us
+// to about 2GB of payload and the equivalent number of internal nodes,
+// but lets us pack the data more tightly.
+#[derive(Clone, Copy)]
+struct PackedRef(u32);
+
+impl PackedRef {
+    fn from_inner(ind: usize) -> PackedRef {
+        assert!(ind <= (std::u32::MAX/2) as usize);
+        PackedRef((ind*2 + 0) as u32)
+    }
+
+    fn from_leaf(pos: usize) -> PackedRef {
+        assert!(pos <= (std::u32::MAX/2) as usize);
+        PackedRef((pos*2 + 1) as u32)
+    }
+    
+    fn unpack(&self) -> NodeRef {
+        match self.0 & 1 {
+            0 => NodeRef::Inner((self.0 >> 1) as usize),
+            _ => NodeRef::Leaf((self.0 >> 1) as usize),
+        }
+    }
+
+    fn is_none(&self) -> bool {
+        self.0 == 0
+    }
+}
+
+// An internal node in the suffix tree. Keeping a full array of 256
+// child node references is a _terrible_ idea for memory use, and completely
+// swamps the benefit of having PackedPos. Making PackedRefs smaller does help
+// since this structure is essentially nothing but. Really though you would use
+// a different representation for child links, classically: a linked list (ugh) or
+// hash table. Another alternative is typical radix tree-style multiple node types
+// depending on child count.
+//
+// We store the label of the incoming edge from the parent along with nodes, since
+// every Node (save the root, which is special in other ways) has at least one
+// incoming edge, because this is a tree.
 struct Node {
-    begin: u32,
-    end: u32,
-    suffix: NodeRef,
-    child: [NodeRef; 256],
+    // The label of the incoming edge is payload[begin..end] (begin inclusive, end exclusive)
+    begin: PackedPos,
+    end: PackedPos,
+    suffix: PackedRef, // suffix link
+    child: [PackedRef; 256], // at most one child per possible character
+}
+
+impl Node {
+    fn label_len(&self) -> usize {
+        self.end.unpack() - self.begin.unpack()
+    }
 }
 
 struct Cursor {
-    node: u32,
-    pos: u32,
+    node: usize,
+    pos: usize,
 }
 
 struct SuffixTree<'a> {
@@ -24,34 +89,32 @@ struct SuffixTree<'a> {
 }
 
 impl<'a> SuffixTree<'a> {
-    fn update(&mut self, cur_in: Cursor, new_end: u32) -> Cursor {
+    fn update(&mut self, cur_in: Cursor, new_end: usize) -> Cursor {
         let mut cur = cur_in;
-        let new_ch = self.payload[new_end as usize];
-        let mut prev_insert_idx: u32 = 0;
+        let new_ch = self.payload[new_end];
+        let mut prev_insert_idx: usize = 0;
 
         loop {
             // Canonicalize active point
             while cur.pos < new_end {
-                let link_ch = self.payload[cur.pos as usize];
-                match self.nodes[cur.node as usize].child[link_ch as usize] {
+                let link_ch = self.payload[cur.pos];
+                match self.nodes[cur.node].child[link_ch as usize].unpack() {
                     NodeRef::Leaf(_) => {
                         // Leafs can absorb the entire rest of the string, and we can't
                         // descend into them; nothing to do.
                         break;
                     }
-                    NodeRef::Inner(idx_u32) => {
-                        let idx = idx_u32 as usize;
+                    NodeRef::Inner(idx) => {
                         debug_assert!(idx != 0, "canonicalize should only follow real links");
-                        let len = self.nodes[idx].end - self.nodes[idx].begin;
+                        let len = self.nodes[idx].label_len();
                         if len > new_end - cur.pos {
                             // Label of this inner node extends past the characters
-                            // we currently have; we can't follow a link further, so
-                            // we're done!
+                            // we currently have, so we're done!
                             break;
                         }
 
                         // Descent into this node and keep going
-                        cur.node = idx_u32;
+                        cur.node = idx;
                         cur.pos += len;
                     }
                 }
@@ -61,7 +124,7 @@ impl<'a> SuffixTree<'a> {
             let insert_node_idx = if cur.pos == new_end {
                 // Would insert right below active node; do we have
                 // a link for this character already?
-                if self.nodes[cur.node as usize].child[new_ch as usize] != NodeRef::Inner(0) {
+                if !self.nodes[cur.node].child[new_ch as usize].is_none() {
                     // We have this already; nothing to do for now!
                     break;
                 } else {
@@ -71,18 +134,21 @@ impl<'a> SuffixTree<'a> {
             } else {
                 // We're in the middle of a longer label; check whether we have a
                 // mismatch (in which case we need to split) or not.
-                let edge_select_ch = self.payload[cur.pos as usize] as usize;
-                let edge_ref = self.nodes[cur.node as usize].child[edge_select_ch as usize];
+
+                // First character at the active point tells us which edge to
+                // follow from the active node
+                let edge_select_ch = self.payload[cur.pos] as usize;
+                let edge_ref = self.nodes[cur.node].child[edge_select_ch];
 
                 // For us to get here, this reference should exist
-                debug_assert!(edge_ref != NodeRef::Inner(0));
+                debug_assert!(!edge_ref.is_none());
 
-                let edge_label_begin = match edge_ref {
+                let edge_label_begin = match edge_ref.unpack() {
                     NodeRef::Leaf(pos) => pos,
-                    NodeRef::Inner(idx) => self.nodes[idx as usize].begin
+                    NodeRef::Inner(idx) => self.nodes[idx].begin.unpack()
                 };
                 let cur_label_pos = edge_label_begin + new_end - cur.pos;
-                let cur_label_ch = self.payload[cur_label_pos as usize];
+                let cur_label_ch = self.payload[cur_label_pos];
 
                 // Do we match the next character of the edge label or not?
                 if new_ch == cur_label_ch {
@@ -91,43 +157,41 @@ impl<'a> SuffixTree<'a> {
                 } else {
                     // We don't, so we need to split this edge
                     let mut n = Node {
-                        begin: edge_label_begin,
-                        end: cur_label_pos,
-                        suffix: NodeRef::Inner(1),
-                        child: [NodeRef::Inner(0); 256]
+                        begin: PackedPos::from(edge_label_begin),
+                        end: PackedPos::from(cur_label_pos),
+                        suffix: PackedRef::from_inner(1),
+                        child: [PackedRef::from_inner(0); 256]
                     };
                     // Transfer over the existing node as first child
-                    n.child[cur_label_ch as usize] = match edge_ref {
-                        NodeRef::Leaf(_) => NodeRef::Leaf(cur_label_pos),
-                        NodeRef::Inner(idx_u32) => {
-                            let idx = idx_u32 as usize;
+                    n.child[cur_label_ch as usize] = match edge_ref.unpack() {
+                        NodeRef::Leaf(_) => PackedRef::from_leaf(cur_label_pos),
+                        NodeRef::Inner(idx) => {
                             // Update the inner node to shorten its edge label
-                            debug_assert!(self.nodes[idx].begin < cur_label_pos && cur_label_pos < self.nodes[idx].end);
-                            self.nodes[idx].begin = cur_label_pos;
-                            NodeRef::Inner(idx_u32)
+                            self.nodes[idx].begin = PackedPos::from(cur_label_pos);
+                            PackedRef::from_inner(idx)
                         }
                     };
                     // Insert the new node and remember its index
-                    let new_node_idx = self.nodes.len() as u32;
+                    let new_node_idx = self.nodes.len();
                     self.nodes.push(n);
                     // Link in the newly create node right below the active node
-                    self.nodes[cur.node as usize].child[edge_select_ch as usize] = NodeRef::Inner(new_node_idx);
+                    self.nodes[cur.node].child[edge_select_ch] = PackedRef::from_inner(new_node_idx);
                     // Return the index of the newly created node
                     new_node_idx
                 }
             };
 
             // Update the suffix links
-            self.nodes[prev_insert_idx as usize].suffix = NodeRef::Inner(insert_node_idx);
+            self.nodes[prev_insert_idx].suffix = PackedRef::from_inner(insert_node_idx);
             prev_insert_idx = insert_node_idx;
 
             // Add the new leaf
-            debug_assert!(self.nodes[insert_node_idx as usize].child[new_ch as usize] == NodeRef::Inner(0));
-            self.nodes[insert_node_idx as usize].child[new_ch as usize] = NodeRef::Leaf(new_end);
+            debug_assert!(self.nodes[insert_node_idx].child[new_ch as usize].is_none());
+            self.nodes[insert_node_idx].child[new_ch as usize] = PackedRef::from_leaf(new_end);
 
             // Continue on to the next suffix
-            if let NodeRef::Inner(idx_u32) = self.nodes[cur.node as usize].suffix {
-                cur.node = idx_u32;
+            if let NodeRef::Inner(idx) = self.nodes[cur.node].suffix.unpack() {
+                cur.node = idx;
             } else {
                 panic!("Suffix links must be to inner nodes!");
             }
@@ -136,57 +200,51 @@ impl<'a> SuffixTree<'a> {
         cur
     }
 
-    fn print_rec(&self, node: NodeRef, indent: usize, cur_end: u32)
+    fn print_rec(&self, node: NodeRef, indent: usize, cur_end: usize)
     {
         print!("{:1$}", "", indent*2);
         match node {
-            NodeRef::Inner(idx_u32) => {
-                let n = &self.nodes[idx_u32 as usize];
-                if idx_u32 == 1 {
+            NodeRef::Inner(idx) => {
+                let n = &self.nodes[idx];
+                if idx == 1 {
                     println!("(root)");
                 } else {
-                    let suffix_ind = match n.suffix {
-                        NodeRef::Inner(idx) => idx,
+                    let suffix_ind = match n.suffix.unpack() {
+                        NodeRef::Inner(sufidx) => sufidx,
                         _ => 0,
                     };
                     println!("\"{}\" (inner {}, suffix={})",
-                        str::from_utf8(&self.payload[n.begin as usize..n.end as usize]).unwrap(),
-                        idx_u32, suffix_ind);
+                        str::from_utf8(&self.payload[n.begin.unpack()..n.end.unpack()]).unwrap(),
+                        idx, suffix_ind);
                 }
                 for r in n.child.iter() {
-                    match r {
-                        NodeRef::Inner(0) => {},
-                        NodeRef::Inner(_) => self.print_rec(*r, indent + 1, cur_end),
-                        NodeRef::Leaf(_) => self.print_rec(*r, indent + 1, cur_end),
+                    if !r.is_none() {
+                        self.print_rec(r.unpack(), indent + 1, cur_end);
                     }
                 }
             },
             NodeRef::Leaf(pos) => {
-                println!("\"{}\" (leaf)", str::from_utf8(&self.payload[pos as usize..cur_end as usize]).unwrap());
+                println!("\"{}\" (leaf)", str::from_utf8(&self.payload[pos..cur_end]).unwrap());
             },
         }
     }
 
     fn print(&self) {
-        self.print_rec(NodeRef::Inner(1), 0, self.payload.len() as u32);
+        self.print_rec(NodeRef::Inner(1), 0, self.payload.len());
     }
 
     fn from(payload: &'a [u8]) -> SuffixTree<'a> {
-        let len32 = payload.len() as u32; // check here!
         let mut st = SuffixTree { payload: payload, nodes: Vec::new() };
 
         // Add the two sentinel nodes
-        // Top is node 0
-        st.nodes.push(Node { begin: 0, end: 0, suffix: NodeRef::Inner(0), child: [NodeRef::Inner(1); 256] });
-        // Root is node 1
-        st.nodes.push(Node { begin: 0, end: 1, suffix: NodeRef::Inner(0), child: [NodeRef::Inner(0); 256] });
+        // Top is node 0. All child links point to the root.
+        st.nodes.push(Node { begin: PackedPos::from(0), end: PackedPos::from(0), suffix: PackedRef::from_inner(0), child: [PackedRef::from_inner(1); 256] });
+        // Root is node 1; this is set up so traversing the link from top to the root consumes
+        // exactly 1 (arbitrary) character.
+        st.nodes.push(Node { begin: PackedPos::from(0), end: PackedPos::from(1), suffix: PackedRef::from_inner(0), child: [PackedRef::from_inner(0); 256] });
 
-        let mut curs = Cursor { node: 1, pos: 0 };
-
-        // We actually do need to iterate over the indices, not the elements of payload, here
-        for i in 0..len32 {
-            curs = st.update(curs, i)
-        }
+        // Update the suffix tree, adding the characters one by one
+        (0..payload.len()).fold(Cursor { node: 1, pos: 0 }, |curs, pos| st.update(curs, pos));
 
         st
     }
