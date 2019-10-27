@@ -31,14 +31,16 @@ enum NodeRef {
 struct PackedRef(u32);
 
 impl PackedRef {
-    fn from_inner(ind: usize) -> PackedRef {
-        assert!(ind <= (std::u32::MAX/2) as usize);
-        PackedRef((ind*2 + 0) as u32)
+    const MAX_IND : usize = (std::u32::MAX / 2) as usize;
+
+    fn from_inner(ind: usize) -> Self {
+        assert!(ind <= Self::MAX_IND);
+        Self((ind*2 + 0) as u32)
     }
 
-    fn from_leaf(pos: usize) -> PackedRef {
-        assert!(pos <= (std::u32::MAX/2) as usize);
-        PackedRef((pos*2 + 1) as u32)
+    fn from_leaf(pos: usize) -> Self {
+        assert!(pos <= Self::MAX_IND);
+        Self((pos*2 + 1) as u32)
     }
     
     fn unpack(&self) -> NodeRef {
@@ -73,6 +75,19 @@ struct Node {
 }
 
 impl Node {
+    fn new_special(begin: usize, end: usize, suffix_ind: usize, child_ind: usize) -> Self {
+        Node {
+            begin: PackedPos::from(begin),
+            end: PackedPos::from(end),
+            suffix: PackedRef::from_inner(suffix_ind),
+            child: [PackedRef::from_inner(child_ind); 256]
+        }
+    }
+
+    fn new(begin: usize, end: usize, suffix_ind: usize) -> Self {
+        Self::new_special(begin, end, suffix_ind, 0)
+    }
+
     fn label_len(&self) -> usize {
         self.end.unpack() - self.begin.unpack()
     }
@@ -113,7 +128,7 @@ impl<'a> SuffixTree<'a> {
                             break;
                         }
 
-                        // Descent into this node and keep going
+                        // Descend into this node and keep going
                         cur.node = idx;
                         cur.pos += len;
                     }
@@ -156,12 +171,7 @@ impl<'a> SuffixTree<'a> {
                     break;
                 } else {
                     // We don't, so we need to split this edge
-                    let mut n = Node {
-                        begin: PackedPos::from(edge_label_begin),
-                        end: PackedPos::from(cur_label_pos),
-                        suffix: PackedRef::from_inner(1),
-                        child: [PackedRef::from_inner(0); 256]
-                    };
+                    let mut n = Node::new(edge_label_begin, cur_label_pos, 1);
                     // Transfer over the existing node as first child
                     n.child[cur_label_ch as usize] = match edge_ref.unpack() {
                         NodeRef::Leaf(_) => PackedRef::from_leaf(cur_label_pos),
@@ -200,8 +210,7 @@ impl<'a> SuffixTree<'a> {
         cur
     }
 
-    fn print_rec(&self, node: NodeRef, indent: usize, cur_end: usize)
-    {
+    fn print_rec(&self, node: NodeRef, indent: usize, cur_end: usize) {
         print!("{:1$}", "", indent*2);
         match node {
             NodeRef::Inner(idx) => {
@@ -238,10 +247,10 @@ impl<'a> SuffixTree<'a> {
 
         // Add the two sentinel nodes
         // Top is node 0. All child links point to the root.
-        st.nodes.push(Node { begin: PackedPos::from(0), end: PackedPos::from(0), suffix: PackedRef::from_inner(0), child: [PackedRef::from_inner(1); 256] });
+        st.nodes.push(Node::new_special(0, 0, 0, 1));
         // Root is node 1; this is set up so traversing the link from top to the root consumes
         // exactly 1 (arbitrary) character.
-        st.nodes.push(Node { begin: PackedPos::from(0), end: PackedPos::from(1), suffix: PackedRef::from_inner(0), child: [PackedRef::from_inner(0); 256] });
+        st.nodes.push(Node::new(0, 1, 0));
 
         // Update the suffix tree, adding the characters one by one
         (0..payload.len()).fold(Cursor { node: 1, pos: 0 }, |curs, pos| st.update(curs, pos));
